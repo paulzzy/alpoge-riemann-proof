@@ -1,0 +1,253 @@
+# Checkpoint probe for the Lean archive published at https://alpo.ge/remark.pdf
+#
+# This does NOT verify the proof. It tests whether a full build could be split
+# across many free runners, by answering:
+#   1. What is the build output made of, and how small is it once the
+#      per-file bookkeeping (*.setup.json) is dropped?
+#   2. Does Lake still treat files as built after that bookkeeping is deleted?
+#   3. Can the compiled files be packed, moved to a fresh runner, restored and
+#      accepted there without rebuilding?
+#   4. Can a second job build new files on top of the restored ones, including
+#      while bookkeeping is being deleted during the build?
+#
+# Job 1 builds one small library with everything it imports and uploads it as
+# an artifact. Job 2 restores it on a fresh runner and builds the next files on
+# top. A third job, which never runs archive code, pushes a short report to
+# the `probe-results` branch.
+
+name: checkpoint
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/checkpoint.yml"]
+  workflow_dispatch:
+    inputs:
+      lib:
+        description: "Library to build as the first slice"
+        default: "Lemmata"
+      next:
+        description: "How many files to build on top of the restored slice"
+        default: "400"
+
+permissions: {}
+
+env:
+  ARCHIVE_BASE: https://alpo.ge/lean.tar.gz.part
+  ARCHIVE_PARTS: "14"
+  ARCHIVE_SHA256: 9631b4f020199e580ba86178cb56c6e9b09f690c2369a80dc4334aa93f49c7fc
+  MATHLIB_REV: 0df444a360eaa60ab8c11dca51a86af692955474
+  TOTAL_SRC_MB: "1030.5"
+  LIB: ${{ inputs.lib || 'Lemmata' }}
+  NEXT: ${{ inputs.next || '400' }}
+  BUILD_TIMEOUT_MIN: "90"
+
+jobs:
+  base:
+    name: build a slice and pack it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    outputs:
+      report: ${{ steps.report.outputs.report }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          [[ "$LIB" =~ ^[A-Za-z0-9_]+$ ]] && [[ "$NEXT" =~ ^[0-9]+$ ]]
+
+      - name: Set up archive, Lean and Mathlib
+        run: bash tools/setup.sh
+
+      - name: Build the slice
+        working-directory: x/lean
+        run: |
+          set -uo pipefail
+          source "$GITHUB_WORKSPACE/tools/lib.sh"
+          python3 -I "$T/select.py" lib "$LIB" 0 1 "$OUT"
+          python3 -I "$T/run.py" "$((BUILD_TIMEOUT_MIN * 60))" "$OUT/build.log" "$OUT/metrics.json" lake build "$LIB"
+          python3 -I "$T/check.py" "Slice" "$OUT/build.log" "$OUT/metrics.json" "$OUT/expected.txt" - | tee -a "$OUT/checks.md" || touch "$OUT/failed"
+
+      - name: Measure the output, drop the bookkeeping and re-check
+        working-directory: x/lean
+        run: |
+          set -uo pipefail
+          source "$GITHUB_WORKSPACE/tools/lib.sh"
+          python3 -I "$T/sizes.py" .lake/build "$OUT/expected.txt" "$TOTAL_SRC_MB" | tee "$OUT/sizes.md"
+          find .lake/build -name '*.setup.json' -delete
+          no_build_check "Slice still counts as built after deleting the bookkeeping" "$LIB"
+
+      - name: Pack the checkpoint
+        working-directory: x/lean
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/tools/lib.sh"
+          mkdir -p "$RUNNER_TEMP/ckpt"
+          raw=$(du -sb .lake/build | cut -f1)
+          tar -C .lake -cf - build | zstd -q -T0 -10 --long=27 -o "$RUNNER_TEMP/ckpt/build.tar.zst"
+          packed=$(stat -c %s "$RUNNER_TEMP/ckpt/build.tar.zst")
+          cp "$OUT/expected.txt" "$RUNNER_TEMP/ckpt/base.txt"
+          row "Checkpoint packed" INFO "$(python3 -I "$T/packinfo.py" "$raw" "$packed" "$TOTAL_SRC_MB" "$OUT/expected.txt")"
+
+      - name: Upload the checkpoint
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checkpoint-base
+          path: ${{ runner.temp }}/ckpt/
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Report
+        id: report
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          bash tools/report.sh "Job 1: build a slice and pack it" > "$RUNNER_TEMP/out/report.md" || echo "## Job 1: report script failed" > "$RUNNER_TEMP/out/report.md"
+          cat "$RUNNER_TEMP/out/report.md" >> "$GITHUB_STEP_SUMMARY"
+          delim="END_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "report<<${delim}"
+            head -c 150000 "$RUNNER_TEMP/out/report.md"
+            echo
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail the job if a check failed
+        run: test ! -e "$RUNNER_TEMP/out/failed"
+
+  top:
+    name: restore on a fresh runner and build on top
+    needs: base
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    outputs:
+      report: ${{ steps.report.outputs.report }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          [[ "$LIB" =~ ^[A-Za-z0-9_]+$ ]] && [[ "$NEXT" =~ ^[0-9]+$ ]]
+
+      - name: Set up archive, Lean and Mathlib
+        run: bash tools/setup.sh
+
+      - name: Download the checkpoint
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checkpoint-base
+          path: ${{ runner.temp }}/ckpt
+
+      - name: Restore the checkpoint and check it
+        working-directory: x/lean
+        run: |
+          set -uo pipefail
+          source "$GITHUB_WORKSPACE/tools/lib.sh"
+          ls -l "$RUNNER_TEMP/ckpt"
+          mkdir -p .lake
+          zstd -dc --long=27 "$RUNNER_TEMP/ckpt/build.tar.zst" | tar -C .lake -xf - || touch "$OUT/failed"
+          row "Checkpoint restored" INFO "$(wc -l < "$RUNNER_TEMP/ckpt/base.txt") files, $(du -sm .lake/build | cut -f1) MB unpacked"
+          no_build_check "Restored slice accepted on a fresh runner without rebuilding" "$LIB"
+
+      - name: Build on top of the checkpoint
+        working-directory: x/lean
+        run: |
+          set -uo pipefail
+          source "$GITHUB_WORKSPACE/tools/lib.sh"
+          python3 -I "$T/plan.py" "$RUNNER_TEMP/ckpt/base.txt" "$NEXT" "$OUT" || { row "Choose files to build on top" FAIL "planning failed"; exit 0; }
+          mapfile -t A < "$OUT/targets_a.txt"
+          mapfile -t B < "$OUT/targets_b.txt"
+          if [ "${#A[@]}" -eq 0 ] || [ "${#B[@]}" -eq 0 ]; then
+            row "Choose files to build on top" FAIL "found ${#A[@]} + ${#B[@]} files"
+            exit 0
+          fi
+          limit=$((BUILD_TIMEOUT_MIN * 60))
+
+          # First half: a normal build on top of the restored files.
+          python3 -I "$T/run.py" "$limit" "$OUT/a.log" "$OUT/a.json" lake build "${A[@]}"
+          python3 -I "$T/check.py" "On top, first half" "$OUT/a.log" "$OUT/a.json" "$OUT/expected_a.txt" "$RUNNER_TEMP/ckpt/base.txt" | tee -a "$OUT/checks.md" || touch "$OUT/failed"
+
+          # Second half: delete bookkeeping files while the build is running.
+          cat "$RUNNER_TEMP/ckpt/base.txt" "$OUT/expected_a.txt" > "$OUT/built_before_b.txt"
+          ( while true; do find .lake/build -name '*.setup.json' -mmin +1 -delete 2>/dev/null; sleep 15; done ) &
+          cleaner=$!
+          python3 -I "$T/run.py" "$limit" "$OUT/b.log" "$OUT/b.json" lake build "${B[@]}"
+          kill "$cleaner" 2>/dev/null || true
+          python3 -I "$T/check.py" "On top, second half, bookkeeping deleted during the build" "$OUT/b.log" "$OUT/b.json" "$OUT/expected_b.txt" "$OUT/built_before_b.txt" | tee -a "$OUT/checks.md" || touch "$OUT/failed"
+
+          cat "$OUT/built_before_b.txt" "$OUT/expected_b.txt" > "$OUT/expected.txt"
+          python3 -I "$T/sizes.py" .lake/build "$OUT/expected.txt" "$TOTAL_SRC_MB" | tee "$OUT/sizes.md"
+          find .lake/build -name '*.setup.json' -delete
+          no_build_check "Everything still counts as built with all bookkeeping deleted" "$LIB" "${A[@]}" "${B[@]}"
+
+      - name: Report
+        id: report
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          bash tools/report.sh "Job 2: restore on a fresh runner and build on top" > "$RUNNER_TEMP/out/report.md" || echo "## Job 2: report script failed" > "$RUNNER_TEMP/out/report.md"
+          cat "$RUNNER_TEMP/out/report.md" >> "$GITHUB_STEP_SUMMARY"
+          delim="END_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "report<<${delim}"
+            head -c 150000 "$RUNNER_TEMP/out/report.md"
+            echo
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail the job if a check failed
+        run: test ! -e "$RUNNER_TEMP/out/failed"
+
+  publish:
+    name: publish report
+    needs: [base, top]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Push report to the probe-results branch
+        env:
+          REPORT_BASE: ${{ needs.base.outputs.report }}
+          REPORT_TOP: ${{ needs.top.outputs.report }}
+          RESULT_BASE: ${{ needs.base.result }}
+          RESULT_TOP: ${{ needs.top.result }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git init -q out && cd out
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch -q --depth 1 "$url" probe-results 2>/dev/null; then
+            git checkout -q -b probe-results FETCH_HEAD
+          else
+            git checkout -q --orphan probe-results
+          fi
+          mkdir -p runs
+          f="runs/checkpoint-${GITHUB_RUN_NUMBER}-attempt-${GITHUB_RUN_ATTEMPT}.md"
+          {
+            echo "# Checkpoint probe run ${GITHUB_RUN_NUMBER}"
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Job results: build and pack = ${RESULT_BASE}; restore and build on top = ${RESULT_TOP}"
+            echo
+            if [ -n "${REPORT_BASE}" ]; then printf '%s\n' "${REPORT_BASE}"; else echo "## Job 1"; echo; echo "No report was produced."; fi
+            echo
+            if [ -n "${REPORT_TOP}" ]; then printf '%s\n' "${REPORT_TOP}"; else echo "## Job 2"; echo; echo "No report was produced."; fi
+          } > "$f"
+          git add "$f"
+          git commit -q -m "Checkpoint probe report for run ${GITHUB_RUN_NUMBER}"
+          git push -q "$url" HEAD:probe-results
