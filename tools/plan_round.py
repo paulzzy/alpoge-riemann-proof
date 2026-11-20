@@ -102,9 +102,14 @@ while stack:
             blocked[w] = 1
             stack.append(w)
 
+# Use no more jobs than the remaining files need: with fewer jobs, fewer files
+# have their imports split across jobs, so more can be built in the round.
+C = args.cap
+todo = sum(1 for u in range(n) if not built[u] and not blocked[u])
+J = max(1, min(args.jobs, -(-todo // C)))
+
 # One pass in dependency order. A file with no unbuilt imports starts in the
 # job that holds its directory; other files follow their imports.
-J, C = args.jobs, args.cap
 key = [".".join(m.split(".")[: args.key_depth]) for m in names]
 indeg = [0] * n
 queue = collections.deque()
