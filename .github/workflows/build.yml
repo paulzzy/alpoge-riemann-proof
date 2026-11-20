@@ -39,6 +39,11 @@ on:
 
 permissions: {}
 
+# Explicit bash, so a failing command in a pipeline fails its step.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: build-rounds
   cancel-in-progress: false
