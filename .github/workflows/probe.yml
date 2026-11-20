@@ -1,0 +1,415 @@
+# Build probe for the Lean archive published at https://alpo.ge/remark.pdf
+#
+# This does NOT verify the proof. It answers two cheaper questions on a free
+# GitHub-hosted runner:
+#   1. Do parts of the archive compile at all against the pinned Lean + Mathlib?
+#   2. How much CPU time, memory and disk does it take per MB of source, so the
+#      cost of a full build can be estimated?
+#
+# Two probes run in parallel:
+#   lib     builds one small library and everything it imports (a contiguous slice)
+#   sample  builds a random sample of files that import only Mathlib, taken from
+#           the whole project
+#
+# The archive is downloaded on the runner and checked against a known SHA-256.
+# Nothing from the archive is stored in this repository. A short report is
+# pushed to the `probe-results` branch by a separate job that never runs
+# archive code.
+
+name: probe
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/probe.yml"]
+  workflow_dispatch:
+    inputs:
+      lib:
+        description: "Library to build as a contiguous slice"
+        default: "Lemmata"
+      sample:
+        description: "How many random Mathlib-only files to build"
+        default: "300"
+      seed:
+        description: "Seed for the random sample"
+        default: "1"
+
+permissions: {}
+
+env:
+  ARCHIVE_BASE: https://alpo.ge/lean.tar.gz.part
+  ARCHIVE_PARTS: "14"
+  ARCHIVE_SHA256: 9631b4f020199e580ba86178cb56c6e9b09f690c2369a80dc4334aa93f49c7fc
+  MATHLIB_REV: 0df444a360eaa60ab8c11dca51a86af692955474
+  TOTAL_SRC_MB: "1030.5"
+  LIB: ${{ inputs.lib || 'Lemmata' }}
+  SAMPLE: ${{ inputs.sample || '300' }}
+  SEED: ${{ inputs.seed || '1' }}
+  BUILD_TIMEOUT_MIN: "270"
+
+jobs:
+  probe:
+    name: probe (${{ matrix.kind }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [lib, sample]
+    env:
+      KIND: ${{ matrix.kind }}
+    outputs:
+      report_lib: ${{ steps.report.outputs.report_lib }}
+      report_sample: ${{ steps.report.outputs.report_sample }}
+    steps:
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          [[ "$LIB" =~ ^[A-Za-z0-9_]+$ ]] || { echo "bad lib"; exit 1; }
+          [[ "$SAMPLE" =~ ^[0-9]+$ ]] || { echo "bad sample"; exit 1; }
+          [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "bad seed"; exit 1; }
+          echo "cores: $(nproc)"; free -g | head -2; uname -r
+
+      - name: Write helper scripts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/out"
+
+          cat > "$RUNNER_TEMP/tools/select.py" <<'PYEOF'
+          # Choose what to build. Writes targets.txt (arguments for `lake build`)
+          # and expected.txt (modules that should end up compiled).
+          import os, random, re, sys
+          kind, lib, n, seed, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+          src = "src"
+          imp_re = re.compile(r"^\s*(?:(?:public|private)\s+)?(?:meta\s+)?import\s+(?:all\s+)?(.*)$")
+          skip = {"all", "public", "private", "meta", "runtime"}
+
+          def header_imports(path):
+              imps, depth = [], 0
+              with open(path, encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      s = line.strip()
+                      if depth:
+                          depth = max(0, depth + s.count("/-") - s.count("-/"))
+                          continue
+                      if not s or s.startswith("--") or s in ("module", "prelude"):
+                          continue
+                      if s.startswith("/-"):
+                          depth = max(0, s.count("/-") - s.count("-/"))
+                          continue
+                      m = imp_re.match(line)
+                      if not m:
+                          break
+                      rest = m.group(1).split("--")[0].replace("import", " ")
+                      imps.extend(t for t in rest.split() if t not in skip)
+              return imps
+
+          mods = {}
+          for root, _, files in os.walk(src):
+              for fn in files:
+                  if fn.endswith(".lean"):
+                      p = os.path.join(root, fn)
+                      mods[os.path.relpath(p, src)[:-5].replace(os.sep, ".")] = p
+          proj = {m: [i for i in header_imports(p) if i in mods] for m, p in mods.items()}
+
+          if kind == "lib":
+              roots = [m for m in mods if m.startswith(lib + ".")]
+              if not roots:
+                  sys.exit("no modules under " + lib)
+              seen, stack = set(), list(roots)
+              while stack:
+                  m = stack.pop()
+                  if m not in seen:
+                      seen.add(m)
+                      stack.extend(proj[m])
+              targets, expected = [lib], sorted(seen)
+          else:
+              leaves = sorted(m for m, deps in proj.items() if not deps)
+              expected = sorted(random.Random(seed).sample(leaves, min(n, len(leaves))))
+              targets = ["+" + m for m in expected]
+              print("files that import only Mathlib:", len(leaves))
+
+          # Names go to lake as separate arguments, one per line of targets.txt.
+          bad = [m for m in expected if m.startswith("-") or re.search(r"\s", m) or not m.isprintable()]
+          if bad:
+              sys.exit("unexpected module names: " + repr(bad[:5]))
+          open(os.path.join(out, "targets.txt"), "w").write("\n".join(targets) + "\n")
+          open(os.path.join(out, "expected.txt"), "w").write("\n".join(expected) + "\n")
+          print("project modules:", len(mods), "| expected to build:", len(expected))
+          PYEOF
+
+          cat > "$RUNNER_TEMP/tools/run.py" <<'PYEOF'
+          # Run a command with a time limit, copy its output to a log file, and
+          # record wall time, CPU time of all child processes and peak memory.
+          import json, os, resource, signal, subprocess, sys, time
+          limit_s, log_path, metrics_path, cmd = float(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4:]
+          t0 = time.time()
+          timed_out = False
+          with open(log_path, "wb") as log:
+              p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+              def on_alarm(signum, frame):
+                  global timed_out
+                  timed_out = True
+                  try:
+                      os.killpg(p.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+              signal.signal(signal.SIGALRM, on_alarm)
+              signal.alarm(int(limit_s))
+              for line in p.stdout:
+                  log.write(line)
+                  sys.stdout.buffer.write(line)
+                  sys.stdout.buffer.flush()
+              code = p.wait()
+              signal.alarm(0)
+          ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+          json.dump({"exit_code": code, "timed_out": timed_out, "wall_s": time.time() - t0,
+                     "cpu_user_s": ru.ru_utime, "cpu_sys_s": ru.ru_stime,
+                     "max_rss_kb": ru.ru_maxrss}, open(metrics_path, "w"))
+          print("exit code:", code, "| timed out:", timed_out)
+          PYEOF
+
+          cat > "$RUNNER_TEMP/tools/report.py" <<'PYEOF'
+          # Turn the build log and metrics into a short markdown report.
+          import json, os, re, sys
+          out, kind, total_mb = sys.argv[1], sys.argv[2], float(sys.argv[3])
+          def read(name, default=""):
+              try:
+                  return open(os.path.join(out, name), encoding="utf-8", errors="replace").read()
+              except OSError:
+                  return default
+          facts = read("facts.txt").strip()
+          expected = [m for m in read("expected.txt").split() if m]
+          log = read("build.log")
+          try:
+              met = json.loads(read("metrics.json"))
+          except ValueError:
+              met = None
+
+          built, src_bytes = [], 0
+          for m in expected:
+              rel = m.replace(".", os.sep)
+              if os.path.exists(os.path.join(".lake", "build", "lib", "lean", rel + ".olean")):
+                  built.append(m)
+                  try:
+                      src_bytes += os.path.getsize(os.path.join("src", rel + ".lean"))
+                  except OSError:
+                      pass
+          out_bytes = 0
+          for root, _, files in os.walk(os.path.join(".lake", "build")):
+              for fn in files:
+                  try:
+                      out_bytes += os.path.getsize(os.path.join(root, fn))
+                  except OSError:
+                      pass
+
+          failed = []
+          tail = log.split("Some required targets logged failures:")
+          if len(tail) > 1:
+              for line in tail[-1].splitlines():
+                  if line.startswith("- "):
+                      failed.append(line[2:].strip())
+
+          def seconds(text):
+              total = 0.0
+              for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)", text):
+                  total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+              return total
+          times = []
+          for m in re.finditer(r"Built (\S+) \(([^)]*)\)", log):
+              times.append((seconds(m.group(2)), m.group(1)))
+          times.sort(reverse=True)
+
+          L = []
+          L.append("## Probe: " + kind)
+          L.append("")
+          if facts:
+              L.append("```")
+              L.append(facts)
+              L.append("```")
+          L.append("| | |")
+          L.append("|---|---|")
+          L.append("| Modules expected | %d |" % len(expected))
+          L.append("| Modules compiled | %d |" % len(built))
+          L.append("| Modules with errors | %d |" % len(failed))
+          if met:
+              cpu = met["cpu_user_s"] + met["cpu_sys_s"]
+              L.append("| Build exit code | %s%s |" % (met["exit_code"], " (hit the time limit)" if met["timed_out"] else ""))
+              L.append("| Wall time | %.1f min |" % (met["wall_s"] / 60))
+              L.append("| CPU time, all processes | %.1f min |" % (cpu / 60))
+              L.append("| Peak memory, largest process | %.2f GB |" % (met["max_rss_kb"] / 1e6))
+          else:
+              cpu = None
+              L.append("| Build | did not run or left no metrics |")
+          L.append("| Source compiled | %.2f MB |" % (src_bytes / 1e6))
+          L.append("| Build output on disk | %.2f GB |" % (out_bytes / 1e9))
+          if cpu and src_bytes:
+              per_mb = cpu / (src_bytes / 1e6)
+              full_h = per_mb * total_mb / 3600
+              L.append("| CPU seconds per MB of source | %.0f |" % per_mb)
+              L.append("| Naive estimate, whole archive (%.1f MB) | %.0f CPU-hours, %.0f GB of output |"
+                       % (total_mb, full_h, out_bytes / src_bytes * total_mb / 1e3))
+          L.append("")
+          L.append("The estimate scales this probe linearly by source size. These files are the "
+                   "shallowest in the project, so treat it as a lower bound.")
+          if times:
+              L.append("")
+              L.append("Slowest files:")
+              L.append("")
+              for t, m in times[:10]:
+                  L.append("- `%s` %.0f s" % (m, t))
+          if failed:
+              L.append("")
+              L.append("Modules with errors (first 50):")
+              L.append("")
+              for m in failed[:50]:
+                  L.append("- `%s`" % m)
+          errs = [ln[:300] for ln in log.splitlines() if ln.startswith("error:")]
+          if errs:
+              L.append("")
+              L.append("First error lines:")
+              L.append("")
+              L.append("```")
+              L.extend(errs[:60])
+              L.append("```")
+          text = "\n".join(L) + "\n"
+          if len(text) > 150000:
+              text = text[:150000] + "\n[truncated]\n"
+          open(os.path.join(out, "report.md"), "w", encoding="utf-8").write(text)
+          print(text)
+          PYEOF
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Download archive and check SHA-256
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dl" && cd "$RUNNER_TEMP/dl"
+          for i in $(seq -w 1 "$ARCHIVE_PARTS"); do
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -O "${ARCHIVE_BASE}${i}"
+          done
+          ls -l
+          echo "${ARCHIVE_SHA256}  -" > expected.sha256
+          cat lean.tar.gz.part?? | sha256sum -c expected.sha256
+
+      - name: Extract
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/x"
+          cat "$RUNNER_TEMP"/dl/lean.tar.gz.part?? | tar xzf - -C "$GITHUB_WORKSPACE/x" --no-same-owner --no-same-permissions
+          rm -rf "$RUNNER_TEMP/dl"
+          cd "$GITHUB_WORKSPACE/x/lean"
+          cat lean-toolchain
+          echo "lean files: $(find src -name '*.lean' | wc -l)"
+
+      - name: Install Lean
+        working-directory: x/lean
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          lean --version
+          lake --version
+
+      - name: Fetch prebuilt Mathlib and check the pin
+        working-directory: x/lean
+        run: |
+          set -euo pipefail
+          lake exe cache get
+          got="$(git -C .lake/packages/mathlib rev-parse HEAD)"
+          echo "mathlib at $got"
+          test "$got" = "$MATHLIB_REV"
+          test -z "$(git -C .lake/packages/mathlib status --porcelain)"
+          # Stop here if the prebuilt cache is incomplete: building Mathlib from
+          # source would not fit in a free runner's time limit.
+          lake build +Mathlib --no-build
+          {
+            echo "runner: $(nproc) cores, $(free -g | awk '/^Mem:/ {print $2}') GB RAM"
+            echo "lean: $(lean --version)"
+            echo "mathlib: $got (clean checkout, prebuilt cache complete)"
+            echo "archive sha256: $ARCHIVE_SHA256"
+          } > "$RUNNER_TEMP/out/facts.txt"
+          df -h /
+
+      - name: Choose targets
+        working-directory: x/lean
+        run: |
+          set -euo pipefail
+          python3 -I "$RUNNER_TEMP/tools/select.py" "$KIND" "$LIB" "$SAMPLE" "$SEED" "$RUNNER_TEMP/out"
+          head -5 "$RUNNER_TEMP/out/targets.txt"
+
+      - name: Build
+        id: build
+        working-directory: x/lean
+        run: |
+          set -uo pipefail
+          mapfile -t targets < "$RUNNER_TEMP/out/targets.txt"
+          python3 -I "$RUNNER_TEMP/tools/run.py" "$((BUILD_TIMEOUT_MIN * 60))" \
+            "$RUNNER_TEMP/out/build.log" "$RUNNER_TEMP/out/metrics.json" \
+            lake build "${targets[@]}"
+          exit 0
+
+      - name: Report
+        id: report
+        if: always()
+        working-directory: x/lean
+        run: |
+          set -uo pipefail
+          python3 -I "$RUNNER_TEMP/tools/report.py" "$RUNNER_TEMP/out" "$KIND" "$TOTAL_SRC_MB" > /dev/null || echo "## Probe: $KIND"$'\n\n'"report script failed" > "$RUNNER_TEMP/out/report.md"
+          cat "$RUNNER_TEMP/out/report.md" >> "$GITHUB_STEP_SUMMARY"
+          delim="END_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "report_${KIND}<<${delim}"
+            cat "$RUNNER_TEMP/out/report.md"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail the job if the build failed
+        run: |
+          python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if m["exit_code"]==0 and not m["timed_out"] else 1)' "$RUNNER_TEMP/out/metrics.json"
+
+  publish:
+    name: publish report
+    needs: probe
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Push report to the probe-results branch
+        env:
+          REPORT_LIB: ${{ needs.probe.outputs.report_lib }}
+          REPORT_SAMPLE: ${{ needs.probe.outputs.report_sample }}
+          PROBE_RESULT: ${{ needs.probe.result }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git init -q out && cd out
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch -q --depth 1 "$url" probe-results 2>/dev/null; then
+            git checkout -q -b probe-results FETCH_HEAD
+          else
+            git checkout -q --orphan probe-results
+          fi
+          mkdir -p runs
+          f="runs/run-${GITHUB_RUN_NUMBER}-attempt-${GITHUB_RUN_ATTEMPT}.md"
+          {
+            echo "# Probe run ${GITHUB_RUN_NUMBER}"
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Overall result of the probe jobs: ${PROBE_RESULT}"
+            echo
+            if [ -n "${REPORT_LIB}" ]; then printf '%s\n' "${REPORT_LIB}"; else echo "## Probe: lib"; echo; echo "No report was produced."; fi
+            echo
+            if [ -n "${REPORT_SAMPLE}" ]; then printf '%s\n' "${REPORT_SAMPLE}"; else echo "## Probe: sample"; echo; echo "No report was produced."; fi
+          } > "$f"
+          git add "$f"
+          git commit -q -m "Probe report for run ${GITHUB_RUN_NUMBER}"
+          git push -q "$url" HEAD:probe-results
